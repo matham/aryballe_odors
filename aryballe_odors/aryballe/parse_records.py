@@ -27,22 +27,49 @@ SENSOR0 = 11
 
 
 class TrialSegment:
+    """Data of component of a trial.
+
+    A trial is composed of e.g. a baseline measurement, analyte and, post analyte measurement. This is the data
+    of a single segment, e.g. the baseline part of the trial.
+    """
 
     sensor_id: list[int]
+    """A 1d list of the same number of columns of `data`, each item is the id of the peptide. A peptide can be
+    represented multiple times due to replicates.
+    """
 
     sensor_pos: list[tuple[str, int]]
+    """A 1d list of the same number of columns of `data`, each item is the position info of the peptide and unique.
+
+    Position is represented by a letter and number, row column format. E.g. ("A", 2) meaning A2.
+    """
 
     time_running: np.ndarray
+    """A 1d of same length as rows in `data`. Each item is the time in seconds corresponding to the row.
+
+    This time value resets for each trial, but is continuous across the baseline, analyte, and post analyte segments.
+    So the first value may be non-zero.
+    """
 
     time: np.ndarray
+    """Same as `time_running`, except we subtract the first element so it starts with time zero.
+    """
 
     unix_time: np.ndarray
+    """A 1d of same length as rows in `data`. Each item is the unix time corresponding to the row.
+    """
 
     humidity: np.ndarray
+    """A 1d of same length as rows in `data`. Each item is humidity sensor measurement corresponding to the row.
+    """
 
     temp: np.ndarray
+    """A 1d of same length as rows in `data`. Each item is temperature sensor measurement corresponding to the row.
+    """
 
     data: np.ndarray
+    """A 2d array. Rows is time, columns is sensors (peptides).
+    """
 
     def __init__(
             self, sensor_id, sensor_pos, relative_time, unix_time, humidity, temp, data):
@@ -58,30 +85,69 @@ class TrialSegment:
 
 
 class AryballeRecord:
+    """Data of a single trial.
+
+    A trial is composed of a baseline measurement, analyte measurement, and post analyte measurement. This contains
+    the data for all 3 components.
+    """
 
     record: int
+    """The number of this record within the sequence of trials, assigned by Aryballe. It is monotonically increasing
+    with each trial sequentially (seemingly).
+    """
 
     run_id: str
+    """The ID assigned by Aryballe to this record.
+    """
 
     run_name: str
+    """The name assigned by Aryballe to this record.
+    """
 
     device_id: str
+    """The device ID used to collect this data.
+    """
 
     sample_name: str
+    """The name of the analyte used as the odor in this trial.
+    """
 
     cycle: int
+    """The count for this analyte.
+
+    Aryballe will iterate through each analyte (odor) a specified number of times, interleaving analytes. This is the
+    number of cycles this analyte has been repeated so far, starting from 1.
+    """
 
     sensor_id: list[int]
+    """Same as TrialSegment.sensor_id.
+    """
 
     sensor_pos: list[tuple[str, int]]
+    """Same as TrialSegment.sensor_pos.
+    """
 
     baseline: TrialSegment
+    """The data for the baseline segment of the trial.
+    """
 
     odor: TrialSegment
+    """The data for the analyte (odor) segment of the trial.
+
+    This follows immediately after the data of `baseline` so the data arrays can be concatenated to get the overall
+    trial data. See `TrialSegment.running_time`.
+    """
 
     iti: TrialSegment
+    """The data for the post analyte segment of the trial.
+
+    This follows immediately after the data of `odor` and `baseline` so the data arrays can be concatenated to get the
+    overall trial data. See `TrialSegment.running_time`.
+    """
 
     tags: set[str]
+    """A set of tags associated with the record.
+    """
 
     def __init__(
             self, record, run_id, run_name, device_id, sample_name,
@@ -106,7 +172,18 @@ class AryballeRecord:
             f"tags=[{','.join(sorted(self.tags))}]>"
         )
 
-    def _get_data(self, section, reset_time=True, subtract_baseline=False):
+    def get_data(self, section, reset_time=True, subtract_baseline=False) -> tuple[np.ndarray, np.ndarray]:
+        """Gets the 2d data (same axis as `TrialSegment.data`) and associated timestamps of the record.
+
+        :param section: The data components - it concatenates the requested data. Can be None, which returns the same as
+            `"baseline+odor+iti"`. Also accepts, `"baseline+odor"`, `"odor+iti"`, `"baseline"`, `"odor"`, and `"iti"`
+            that returns a single array of the data.
+        :param reset_time: Whether to reset the timestamp of the first data row to zero.
+        :param subtract_baseline: Whether to subtract the baseline per sensor, using `get_baseline_offset`, from the
+            resulting data.
+        :return: A tuple of data and time. Data is time X sensors (rows, columns). Time is the 1d array of the
+        associated continuous timestamps of the data.
+        """
         match section:
             case None | "baseline+odor+iti":
                 # all sections
@@ -129,11 +206,17 @@ class AryballeRecord:
         if reset_time:
             time -= time[0]
         if subtract_baseline:
-            data -= self._get_baseline_offset()
+            data -= self.get_baseline_offset()
 
         return data, time
 
     def _get_sensor_masks(self) -> dict[int, np.ndarray]:
+        """Gets a dict mapping sensor IDs to a mask of the columns of the repeats of this sensor (peptide).
+
+        Each key is the ID of the sensor (e.g. 25). The corresponding value is the logical ndarray which has true values
+        at the indices (columns) corresponding to the repeats of this peptide. Indexing `data` or `sensor_pos` will
+        return the columns (values) of this sensor repeats.
+        """
         sensor_ids = self.sensor_id
 
         masks = {}
@@ -142,11 +225,22 @@ class AryballeRecord:
 
         return masks
 
-    def _get_baseline_offset(self):
-        return np.median(self.baseline.data, axis=0, keepdims=True)
+    def get_baseline_offset(self, keep2dims=True) -> np.ndarray:
+        """Returns the offset of each sensor to zero it.
 
-    def _normalize_data(self, data):
-        offset = self._get_baseline_offset()
+        :param keep2dims: If True will keep the first dim to have a shape of 1 X N, otherwise just 1D N sized array.
+        :return: An array, that is the offset for each sensor. Such that subtracting it from the corresponding sensor
+            will keep the average value at zero, as computed from the baseline data.
+        """
+        return np.median(self.baseline.data, axis=0, keepdims=keep2dims)
+
+    def normalize_data(self, data) -> np.ndarray:
+        """Normalizes the input data.
+
+        Normalization is computed by removing the offset computed from the baseline. Then, it's scaled by the magnitude
+        at the end of the analyte period. It is computed as a single value for all the sensors.
+        """
+        offset = self.get_baseline_offset()
         scale = np.median(np.abs(self.odor.data[-1, :] - offset[0, :]))
 
         if len(data.shape) == 2:
@@ -156,11 +250,22 @@ class AryballeRecord:
     def get_data_by_sensor(
             self, section=None, reset_time=True, subtract_baseline=False, normalize=False
     ) -> tuple[dict[int, np.ndarray], np.ndarray]:
-        data, time = self._get_data(
+        """Returns the sensor data, split by sensor (peptide) type.
+
+        :param section: See `get_data`.
+        :param reset_time: See `get_data`.
+        :param subtract_baseline: See `get_data`.
+        :param normalize: Whether to normalize the data using `normalize_data`. Takes precedence over
+            `subtract_baseline`.
+        :return: Similar to `get_data`, but split into mapping for sensor (peptide) IDs to repeats of the peptide.
+            I.e. keys are the IDs of the peptides. Each value is a 2d array, with rows being time, and columns are
+            the repeats of only this peptide.
+        """
+        data, time = self.get_data(
             section, reset_time=reset_time, subtract_baseline=subtract_baseline and not normalize)
 
         if normalize:
-            data = self._normalize_data(data)
+            data = self.normalize_data(data)
 
         sensor_data = {}
         for sensor_id, mask in self._get_sensor_masks().items():
@@ -169,10 +274,19 @@ class AryballeRecord:
         return sensor_data, time
 
     def get_final_odor_sensor_data(self, subtract_baseline=False, normalize=False) -> dict[int, np.ndarray]:
+        """Returns the sensor data from the end of the analyte (odor segment), split by sensor (peptide) type.
+
+        :param subtract_baseline: Whether to subtract the baseline from the data using `get_baseline_offset`.
+        :param normalize: Whether to normalize the data using `normalize_data`. Takes precedence over
+            `subtract_baseline`.
+        :return: The last data sample of the odor segment, split by peptide. I.e. a mapping of sensor (peptide) IDs to
+            repeats of the peptide. Keys are the IDs of the peptides. Each value is a 1d array with the value of the
+            repeats of only this peptide.
+        """
         if normalize:
-            data = self._normalize_data(self.odor.data[-1, :])
+            data = self.normalize_data(self.odor.data[-1, :])
         elif subtract_baseline:
-            data = self.odor.data[-1, :] - self._get_baseline_offset()[0, :]
+            data = self.odor.data[-1, :] - self.get_baseline_offset()[0, :]
         else:
             data = self.odor.data[-1, :]
 
@@ -183,16 +297,29 @@ class AryballeRecord:
         return sensor_data
 
     def get_flat_final_odor_sensor_data(self, subtract_baseline=False, normalize=False) -> np.ndarray:
+        """Returns the sensor data from the end of the analyte (odor segment).
+
+        :param subtract_baseline: Whether to subtract the baseline from the data using `get_baseline_offset`.
+        :param normalize: Whether to normalize the data using `normalize_data`. Takes precedence over
+            `subtract_baseline`.
+        :return: The last data sample of the odor segment as 1d array, where each value corresponds to a sensor
+            in `sensor_id`.
+        """
         if normalize:
-            data = self._normalize_data(self.odor.data[-1, :])
+            data = self.normalize_data(self.odor.data[-1, :])
         elif subtract_baseline:
-            data = self.odor.data[-1, :] - self._get_baseline_offset()[0, :]
+            data = self.odor.data[-1, :] - self.get_baseline_offset()[0, :]
         else:
             data = self.odor.data[-1, :]
 
         return data
 
     def estimate_baseline_slope(self) -> dict[int, np.ndarray]:
+        """Estimates the slope of the time series baseline data.
+
+        Returns a dict whose keys is the sensor (peptide) ID and values is the estimate of the time varying slope
+        for that sensor ID. It's the average of all the repeats for each sensor.
+        """
         data = self.baseline.data
 
         slopes = {}
@@ -203,6 +330,12 @@ class AryballeRecord:
         return slopes
 
     def estimate_iti_slope(self, end_duration=None) -> dict[int, np.ndarray]:
+        """Estimates the slope of the time series post-analyte (odor) data as the data goes back to baseline.
+
+        :param end_duration: If not None, the number of seconds from the end of the segment to use.
+        :return: A dict whose keys is the sensor (peptide) ID and values is the estimate of the time varying slope
+            for that sensor ID. It's the average of all the repeats for each sensor.
+        """
         data = self.iti.data
         time = self.iti.time
 
@@ -221,24 +354,40 @@ class AryballeRecord:
 
 
 class AryballeRecords:
+    """Parses and visualizes the Aryballe sensor records.
+    """
 
     records: list[AryballeRecord]
 
     @property
     def sensor_id(self) -> list[int]:
+        """See TrialSegment.sensor_id.
+        """
         return self.records[0].sensor_id
 
     @property
     def sensor_pos(self) -> list[tuple[str, int]]:
+        """See TrialSegment.sensor_pos.
+        """
         return self.records[0].sensor_pos
 
     def __init__(self):
         self.records = []
 
-    def add_records(self, filename: str):
-        self.records.extend(self._parse_records_csv(filename))
+    def add_csv_records(self, filename: str) -> None:
+        """Adds the records from the given CSV file to `records`.
+
+        :param filename: The CSV filename as exported from Aryballe hub.
+        """
+        self.records.extend(self.parse_records_csv(filename))
 
     def _split_rows_by_id(self, data: list, idx: int) -> list[tuple[int, int]]:
+        """Splits the 2d `data` into groups of rows, using the column `idx` such that each group of rows has all the
+        same value for the column.
+
+        :return: A list of tuples, where each tuple is the start and end index in `data` for a consecutive group of
+            rows. The end index is the index of the row *after* the last row of that group.
+        """
         last = None
         indices = []
 
@@ -249,7 +398,11 @@ class AryballeRecords:
 
         return list(zip(indices, indices[1:] + [len(data)]))
 
-    def _parse_records_csv(self, filename: str) -> list[AryballeRecord]:
+    def parse_records_csv(self, filename: str) -> list[AryballeRecord]:
+        """Parses and returns the records from the given CSV file.
+
+        :param filename: The CSV filename as exported from Aryballe hub.
+        """
         with open(filename, 'r') as fh:
             reader = list(csv.reader(fh, delimiter=","))
 
@@ -582,16 +735,16 @@ class AryballeRecords:
 
 if __name__ == "__main__":
     records = AryballeRecords()
-    records.add_records(r"C:\Users\Matthew Einhorn\Downloads\sensors\pure_vs_10pa.sensograms.csv")
-    # records.add_records(r"C:\Users\Matthew Einhorn\Downloads\sensors\pure_long.sensograms.csv")
+    records.add_csv_records(r"C:\Users\Matthew Einhorn\Downloads\sensors\pure_vs_10pa.sensograms.csv")
+    # records.add_csv_records(r"C:\Users\Matthew Einhorn\Downloads\sensors\pure_long.sensograms.csv")
     # for record in records.records:
     #     print(record)
     # for name in records.get_sample_names(True):
-    #     records.plot_by_sensor_id(9, name, section=None, normalize=False)
-    #     records.plot_final_odor_data_by_sensor(name, normalize=False)
-    # records.plot_by_sensor_id(9, "acetone 10Pa", section=None)
-    # records.plot_final_odor_data_by_sensor("acetone 10Pa")
-    records.plot_all_final_odor_data_by_sensor()
+        # records.plot_by_sensor_id(9, name, section=None, normalize=False)
+        # records.plot_final_odor_data_by_sensor(name, normalize=False)
+    # records.plot_by_sensor_id(9, "acetone pure", section=None)
+    # records.plot_final_odor_data_by_sensor("acetone pure")
+    # records.plot_all_final_odor_data_by_sensor()
     # records.plot_all_final_odor_data_across_time(9, normalize=False)
     # records.plot_sensor_binding_across_time(9)
     # records.plot_sensor_binding_by_cycle_odor(9, use_post_data=True, abs_threshold=.06)
@@ -599,5 +752,5 @@ if __name__ == "__main__":
     # pca = records.compute_sensor_pca(normalize=False)
     #
     # records2 = AryballeRecords()
-    # records2.add_records(r"C:\Users\Matthew Einhorn\Downloads\sensors\pure_long.sensograms.csv")
+    # records2.add_csv_records(r"C:\Users\Matthew Einhorn\Downloads\sensors\pure_long.sensograms.csv")
     # records.plot_sensor_pca(pca, added_records=records2.records, normalize=False)
