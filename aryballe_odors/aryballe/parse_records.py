@@ -174,15 +174,14 @@ class AryballeRecord:
             f"tags=[{','.join(sorted(self.tags))}]>"
         )
 
-    def get_data(self, section, reset_time=True, subtract_baseline=False) -> tuple[np.ndarray, np.ndarray]:
+    def get_data(self, section, normalization: set, norm_odor_peak: bool, reset_time=True) -> tuple[np.ndarray, np.ndarray]:
         """Gets the 2d data (same axis as `TrialSegment.data`) and associated timestamps of the record.
 
         :param section: The data components - it concatenates the requested data. Can be None, which returns the same as
             `"baseline+odor+iti"`. Also accepts, `"baseline+odor"`, `"odor+iti"`, `"baseline"`, `"odor"`, and `"iti"`
             that returns a single array of the data.
+        :param normalization: See `normalize_data`.
         :param reset_time: Whether to reset the timestamp of the first data row to zero.
-        :param subtract_baseline: Whether to subtract the baseline per sensor, using `get_baseline_offset`, from the
-            resulting data.
         :return: A tuple of data and time. Data is time X sensors (rows, columns). Time is the 1d array of the
         associated continuous timestamps of the data.
         """
@@ -207,8 +206,8 @@ class AryballeRecord:
         time = np.concatenate([getattr(item, "time_running") for item in items], axis=0)
         if reset_time:
             time -= time[0]
-        if subtract_baseline:
-            data -= self.get_baseline_offset()
+
+        data = self.normalize_data(data, normalization=normalization, norm_odor_peak=norm_odor_peak)
 
         return data, time
 
@@ -236,7 +235,7 @@ class AryballeRecord:
         """
         return np.median(self.baseline.data, axis=0, keepdims=keep2dims)
 
-    def normalize_data(self, data) -> np.ndarray:
+    def normalize_data(self, data, normalization: set, norm_odor_peak: bool) -> np.ndarray:
         """Normalizes the input data.
 
         Normalization is computed by removing the offset computed from the baseline. Then, it's scaled by the magnitude
@@ -247,40 +246,43 @@ class AryballeRecord:
         if d1:
             data = data[np.newaxis, :]
 
-        offset = self.get_baseline_offset(keep2dims=True)
-        offset_corr = data - offset
+        if "baseline" in normalization:
+            offset = self.get_baseline_offset(keep2dims=True)
+            data -= offset
 
-        blank_corr = offset_corr - np.median(offset_corr[:, blank_idx], axis=1, keepdims=True)
+        if "blank" in normalization:
+            data -= np.median(data[:, blank_idx], axis=1, keepdims=True)
 
-        # diff = self.odor.data[-1, :] - offset[0, :]
-        # scale = np.median(np.abs(diff))
-        scaled = blank_corr
+        if "norm" in normalization:
+            norm_data = data
+            if norm_odor_peak:
+                norm_data = self.odor.data[-1, :][np.newaxis, :]
 
-        # scaled = np.divide(blank_corr, scale, out=np.zeros_like(blank_corr), where=scale != 0)
+            medians = []
+            for mask in self._get_sensor_masks().values():
+                medians.append(np.median(norm_data[:, mask], axis=1, keepdims=True))
+            scale = np.linalg.norm(np.hstack(medians), axis=1, keepdims=True)
+
+            data = np.divide(data, scale, out=np.zeros_like(data), where=scale != 0)
 
         if d1:
-            return scaled[0, :]
-        return scaled
+            return data[0, :]
+        return data
 
     def get_data_by_sensor(
-            self, section=None, reset_time=True, subtract_baseline=False, normalize=False
+            self, normalization: set, norm_odor_peak: bool, section=None, reset_time=True
     ) -> tuple[dict[int, np.ndarray], np.ndarray]:
         """Returns the sensor data, split by sensor (peptide) type.
 
         :param section: See `get_data`.
+        :param normalization: See `normalize_data`.
         :param reset_time: See `get_data`.
-        :param subtract_baseline: See `get_data`.
-        :param normalize: Whether to normalize the data using `normalize_data`. Takes precedence over
-            `subtract_baseline`.
         :return: Similar to `get_data`, but split into mapping for sensor (peptide) IDs to repeats of the peptide.
             I.e. keys are the IDs of the peptides. Each value is a 2d array, with rows being time, and columns are
             the repeats of only this peptide.
         """
         data, time = self.get_data(
-            section, reset_time=reset_time, subtract_baseline=subtract_baseline and not normalize)
-
-        if normalize:
-            data = self.normalize_data(data)
+            section, normalization=normalization, norm_odor_peak=norm_odor_peak, reset_time=reset_time)
 
         sensor_data = {}
         for sensor_id, mask in self._get_sensor_masks().items():
@@ -288,22 +290,15 @@ class AryballeRecord:
 
         return sensor_data, time
 
-    def get_final_odor_sensor_data(self, subtract_baseline=False, normalize=False) -> dict[int, np.ndarray]:
+    def get_final_odor_sensor_data(self, normalization: set) -> dict[int, np.ndarray]:
         """Returns the sensor data from the end of the analyte (odor segment), split by sensor (peptide) type.
 
-        :param subtract_baseline: Whether to subtract the baseline from the data using `get_baseline_offset`.
-        :param normalize: Whether to normalize the data using `normalize_data`. Takes precedence over
-            `subtract_baseline`.
+        :param normalization: See `normalize_data`.
         :return: The last data sample of the odor segment, split by peptide. I.e. a mapping of sensor (peptide) IDs to
             repeats of the peptide. Keys are the IDs of the peptides. Each value is a 1d array with the value of the
             repeats of only this peptide.
         """
-        if normalize:
-            data = self.normalize_data(self.odor.data[-1, :])
-        elif subtract_baseline:
-            data = self.odor.data[-1, :] - self.get_baseline_offset()[0, :]
-        else:
-            data = self.odor.data[-1, :]
+        data = self.get_flat_final_odor_sensor_data(normalization=normalization)
 
         sensor_data = {}
         for sensor_id, mask in self._get_sensor_masks().items():
@@ -311,21 +306,14 @@ class AryballeRecord:
 
         return sensor_data
 
-    def get_flat_final_odor_sensor_data(self, subtract_baseline=False, normalize=False) -> np.ndarray:
+    def get_flat_final_odor_sensor_data(self, normalization: set) -> np.ndarray:
         """Returns the sensor data from the end of the analyte (odor segment).
 
-        :param subtract_baseline: Whether to subtract the baseline from the data using `get_baseline_offset`.
-        :param normalize: Whether to normalize the data using `normalize_data`. Takes precedence over
-            `subtract_baseline`.
+        :param normalization: See `normalize_data`.
         :return: The last data sample of the odor segment as 1d array, where each value corresponds to a sensor
             in `sensor_id`.
         """
-        if normalize:
-            data = self.normalize_data(self.odor.data[-1, :])
-        elif subtract_baseline:
-            data = self.odor.data[-1, :] - self.get_baseline_offset()[0, :]
-        else:
-            data = self.odor.data[-1, :]
+        data = self.normalize_data(self.odor.data[-1, :], normalization=normalization, norm_odor_peak=True)
 
         return data
 
@@ -492,9 +480,25 @@ class AryballeRecords:
 
         return fig, ax_map
 
+    def _save_or_show(self, normalization: set, save_fig_root: str | None = None, save_fig_prefix: str = ""):
+        if save_fig_root:
+            norm = "none"
+            if normalization:
+                norm = ",".join(sorted(normalization))
+
+            fig = plt.gcf()
+            fig.set_size_inches(15, 9)
+            fig.savefig(
+                f"{save_fig_root}/{save_fig_prefix}_norm={norm}.png", bbox_inches='tight',
+                dpi=300
+            )
+            plt.close()
+        else:
+            plt.show()
+
     def plot_by_sensor_id(
-            self, n_sensors, odor_name: str, section=None, n_rows=3, subtract_baseline=False, normalize=False,
-            save_fig_root: str | None = None
+            self, n_sensors, odor_name: str, normalization: set, norm_odor_peak: bool, section=None, n_rows=3,
+            save_fig_root: str | None = None, save_fig_prefix: str = ""
     ):
         fig, ax_map = self._get_fig_by_sensor(n_sensors, n_rows, sharey=True, sharex=True)
         ax_count = defaultdict(int)
@@ -503,7 +507,8 @@ class AryballeRecords:
             if record.sample_name != odor_name:
                 continue
 
-            data, time = record.get_data_by_sensor(section, subtract_baseline=subtract_baseline, normalize=normalize)
+            data, time = record.get_data_by_sensor(
+                normalization=normalization, norm_odor_peak=norm_odor_peak, section=section, reset_time=True)
             for sensor, values in data.items():
                 ax_map[sensor].plot(time, values, '-')
                 ax_count[sensor] += values.shape[1]
@@ -513,16 +518,12 @@ class AryballeRecords:
         fig.supxlabel("Time (s)")
         fig.supylabel("Amplitude")
         fig.suptitle(odor_name)
-        if save_fig_root:
-            fig.set_size_inches(15, 9)
-            fig.savefig(f"{save_fig_root}/{odor_name}_norm={int(normalize)}.png", bbox_inches='tight', dpi=300)
-            plt.close()
-        else:
-            plt.show()
+
+        self._save_or_show(normalization, save_fig_root, save_fig_prefix + f"_{odor_name}")
 
     def plot_final_odor_data_by_sensor(
-            self, odor_name: str, subtract_baseline=False, ax: plt.Axes = None, normalize=False,
-            save_fig_root: str | None = None
+            self, odor_name: str, normalization: set, ax: plt.Axes = None, save_fig_root: str | None = None,
+            save_fig_prefix: str = ""
     ):
         add_labels = ax is None
         if ax is None:
@@ -535,7 +536,7 @@ class AryballeRecords:
             if record.sample_name != odor_name:
                 continue
 
-            data = record.get_final_odor_sensor_data(subtract_baseline=subtract_baseline, normalize=normalize)
+            data = record.get_final_odor_sensor_data(normalization=normalization)
             start = 0
             for sensor, values in sorted(data.items(), key=lambda x: x[0]):
                 n = len(values)
@@ -554,16 +555,10 @@ class AryballeRecords:
             ax.set_ylabel("Amplitude")
             ax.set_title(odor_name)
 
-            if save_fig_root:
-                fig = plt.gcf()
-                fig.set_size_inches(15, 9)
-                fig.savefig(
-                    f"{save_fig_root}/{odor_name}_norm={int(normalize)}.png", bbox_inches='tight', dpi=300)
-                plt.close()
-            else:
-                plt.show()
+            self._save_or_show(normalization, save_fig_root, save_fig_prefix + f"_{odor_name}")
 
-    def plot_all_final_odor_data_by_sensor(self, subtract_baseline=False, normalize=False, n_rows=3):
+    def plot_all_final_odor_data_by_sensor(
+            self, normalization: set, n_rows=3, save_fig_root: str | None = None, save_fig_prefix: str = ""):
         odors = list(sorted(set(r.sample_name for r in self.records)))
 
         n_cols = int(math.ceil(len(odors) / n_rows))
@@ -571,21 +566,22 @@ class AryballeRecords:
         ax_flat = axs.flatten().tolist()
 
         for ax, name in zip(ax_flat, odors):
-            self.plot_final_odor_data_by_sensor(name, subtract_baseline=subtract_baseline, ax=ax, normalize=normalize)
+            self.plot_final_odor_data_by_sensor(name, normalization, ax=ax)
             ax.set_title(name)
 
         fig.supxlabel("Sensor")
         fig.supylabel("Amplitude")
-        plt.show()
+        self._save_or_show(normalization, save_fig_root, save_fig_prefix)
 
-    def plot_all_final_odor_data_across_time(self, n_sensors, n_rows=3, subtract_baseline=False, normalize=False):
+    def plot_all_final_odor_data_across_time(
+            self, n_sensors, normalization: set, n_rows=3, save_fig_root: str | None = None, save_fig_prefix: str = ""):
         records = sorted(self.records, key=lambda r: r.baseline.unix_time[0])
         fig, ax_map = self._get_fig_by_sensor(n_sensors, n_rows, sharey=False, sharex=True)
         cmap = plt.get_cmap('tab20')
         color_names = {name: cmap(i % cmap.N) for i, name in enumerate(self.get_sample_names(True))}
 
         for i, record in enumerate(records):
-            data = record.get_final_odor_sensor_data(subtract_baseline=subtract_baseline, normalize=normalize)
+            data = record.get_final_odor_sensor_data(normalization=normalization)
             for sensor, values in sorted(data.items(), key=lambda x: x[0]):
                 ax_map[sensor].plot([i], np.median(np.abs(values)), '*', color=color_names[record.sample_name])
 
@@ -594,7 +590,7 @@ class AryballeRecords:
         fig.supxlabel("Trial order")
         fig.supylabel("Final odor intensity")
         fig.suptitle("Sensor odor intensity for all trials")
-        plt.show()
+        self._save_or_show(normalization, save_fig_root, save_fig_prefix)
 
     def plot_sensor_binding_across_time(self, n_sensors, n_rows=3, end_duration=5):
         records = sorted(self.records, key=lambda r: r.baseline.unix_time[0])
@@ -711,10 +707,10 @@ class AryballeRecords:
                 writer.writerow(map(str, row))
                 last_record = record
 
-    def compute_sensor_pca(self, n_dim=2, subtract_baseline=False, normalize=False):
+    def compute_sensor_pca(self, normalization: set, n_dim=2):
         aggregate_data = []
         for record in self.records:
-            row = record.get_flat_final_odor_sensor_data(subtract_baseline=subtract_baseline, normalize=normalize)
+            row = record.get_flat_final_odor_sensor_data(normalization=normalization)
             aggregate_data.append(row)
         data = np.vstack(aggregate_data)
 
@@ -723,7 +719,9 @@ class AryballeRecords:
 
         return pca
 
-    def plot_sensor_pca(self, pca, n_dim=2, added_records=None, subtract_baseline=False, normalize=False):
+    def plot_sensor_pca(
+            self, pca, normalization: set, n_dim=2, added_records=None, save_fig_root: str | None = None,
+            save_fig_prefix: str = ""):
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d" if n_dim == 3 else None)
         cmap = plt.get_cmap("tab10")
@@ -731,7 +729,7 @@ class AryballeRecords:
 
         for markers, records in ((("*", "."), self.records), (("h", "o"), added_records or [])):
             for record in records:
-                row = record.get_flat_final_odor_sensor_data(subtract_baseline=subtract_baseline, normalize=normalize)
+                row = record.get_flat_final_odor_sensor_data(normalization=normalization)
                 proj = pca.transform(row[np.newaxis, :])
 
                 name = record.sample_name
@@ -751,7 +749,7 @@ class AryballeRecords:
         ax.set_xlabel("PCA 1")
         ax.set_xlabel("PCA 2")
         fig.suptitle(f"PCA - explained variance = {sum(pca.explained_variance_ratio_):0.2f}")
-        plt.show()
+        self._save_or_show(normalization, save_fig_root, save_fig_prefix)
 
     def get_sample_names(self, sort=True) -> list[str]:
         if not sort:
@@ -766,22 +764,40 @@ class AryballeRecords:
 
 if __name__ == "__main__":
     records = AryballeRecords()
+    fig_root = r"C:\Users\Matthew Einhorn\Downloads\figs"
     records.add_csv_records(r"C:\Users\Matthew Einhorn\Downloads\sensors\pure_vs_10pa.sensograms.csv")
     # records.add_csv_records(r"C:\Users\Matthew Einhorn\Downloads\sensors\pure_long.sensograms.csv")
     # for record in records.records:
     #     print(record)
-    # for name in records.get_sample_names(True):
-        # records.plot_by_sensor_id(9, name, section=None, normalize=False)
-        # records.plot_final_odor_data_by_sensor(name, normalize=False)
-    # records.plot_by_sensor_id(9, "acetone pure", section=None)
-    # records.plot_final_odor_data_by_sensor("acetone pure")
-    # records.plot_all_final_odor_data_by_sensor()
-    # records.plot_all_final_odor_data_across_time(9, normalize=False)
-    # records.plot_sensor_binding_across_time(9)
-    # records.plot_sensor_binding_by_cycle_odor(9, use_post_data=True, abs_threshold=.06)
-    # records.write_sensor_binding_by_cycle_odor(r"C:\Users\Matthew Einhorn\Downloads\sensors\sensor_binding_long_iti.csv")
-    # pca = records.compute_sensor_pca(normalize=False)
-    #
-    # records2 = AryballeRecords()
-    # records2.add_csv_records(r"C:\Users\Matthew Einhorn\Downloads\sensors\pure_long.sensograms.csv")
-    # records.plot_sensor_pca(pca, added_records=records2.records, normalize=False)
+    for norms in (set(), {"baseline", }, {"baseline", "blank"}, {"baseline", "blank", "norm"}):
+        for name in records.get_sample_names(sort=True):
+            records.plot_by_sensor_id(
+                9, name, normalization=norms, norm_odor_peak=False, section=None, save_fig_root=fig_root,
+                save_fig_prefix="odor_full_trace"
+            )
+            if "norm" in norms:
+                records.plot_by_sensor_id(
+                    9, name, normalization=norms, norm_odor_peak=True, section=None, save_fig_root=fig_root,
+                    save_fig_prefix="odor_full_trace_peak_normed"
+                )
+            records.plot_final_odor_data_by_sensor(
+                name, normalization=norms, save_fig_root=fig_root, save_fig_prefix="odor_final_peak")
+        # records.plot_by_sensor_id(9, "acetone pure", section=None)
+        # records.plot_final_odor_data_by_sensor("acetone pure")
+        records.plot_all_final_odor_data_by_sensor(
+            normalization=norms, save_fig_root=fig_root, save_fig_prefix="by_sensor_by_odor")
+        records.plot_all_final_odor_data_across_time(
+            9, normalization=norms, save_fig_root=fig_root, save_fig_prefix="by_sensor_by_trial")
+        # records.plot_sensor_binding_across_time(9)
+        # records.plot_sensor_binding_by_cycle_odor(9, use_post_data=True, abs_threshold=.06)
+        # records.write_sensor_binding_by_cycle_odor(r"C:\Users\Matthew Einhorn\Downloads\sensors\sensor_binding_long_iti.csv")
+
+        pca = records.compute_sensor_pca(normalization=norms)
+        records.plot_sensor_pca(
+            pca, normalization=norms, save_fig_root=fig_root, save_fig_prefix="pca_1st_set_only")
+
+        records2 = AryballeRecords()
+        records2.add_csv_records(r"C:\Users\Matthew Einhorn\Downloads\sensors\pure_long.sensograms.csv")
+        records.plot_sensor_pca(
+            pca, normalization=norms, added_records=records2.records, save_fig_root=fig_root,
+            save_fig_prefix="pca_1st_set_with_2nd_only_tested")
