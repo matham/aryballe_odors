@@ -25,6 +25,8 @@ HUMIDITY_VAL = 9
 TEMP_VAL = 10
 SENSOR0 = 11
 
+BLANK_SENSOR = 1
+
 
 class TrialSegment:
     """Data of component of a trial.
@@ -240,12 +242,25 @@ class AryballeRecord:
         Normalization is computed by removing the offset computed from the baseline. Then, it's scaled by the magnitude
         at the end of the analyte period. It is computed as a single value for all the sensors.
         """
-        offset = self.get_baseline_offset()
-        scale = np.median(np.abs(self.odor.data[-1, :] - offset[0, :]))
+        d1 = len(data.shape) == 1
+        blank_idx = np.array(self.sensor_id, dtype=np.int_) == BLANK_SENSOR
+        if d1:
+            data = data[np.newaxis, :]
 
-        if len(data.shape) == 2:
-            return (data - offset) / scale
-        return (data - offset[0, :]) / scale
+        offset = self.get_baseline_offset(keep2dims=True)
+        offset_corr = data - offset
+
+        blank_corr = offset_corr - np.median(offset_corr[:, blank_idx], axis=1, keepdims=True)
+
+        # diff = self.odor.data[-1, :] - offset[0, :]
+        # scale = np.median(np.abs(diff))
+        scaled = blank_corr
+
+        # scaled = np.divide(blank_corr, scale, out=np.zeros_like(blank_corr), where=scale != 0)
+
+        if d1:
+            return scaled[0, :]
+        return scaled
 
     def get_data_by_sensor(
             self, section=None, reset_time=True, subtract_baseline=False, normalize=False
@@ -478,7 +493,9 @@ class AryballeRecords:
         return fig, ax_map
 
     def plot_by_sensor_id(
-            self, n_sensors, odor_name: str, section=None, n_rows=3, subtract_baseline=False, normalize=False):
+            self, n_sensors, odor_name: str, section=None, n_rows=3, subtract_baseline=False, normalize=False,
+            save_fig_root: str | None = None
+    ):
         fig, ax_map = self._get_fig_by_sensor(n_sensors, n_rows, sharey=True, sharex=True)
         ax_count = defaultdict(int)
 
@@ -496,10 +513,17 @@ class AryballeRecords:
         fig.supxlabel("Time (s)")
         fig.supylabel("Amplitude")
         fig.suptitle(odor_name)
-        plt.show()
+        if save_fig_root:
+            fig.set_size_inches(15, 9)
+            fig.savefig(f"{save_fig_root}/{odor_name}_norm={int(normalize)}.png", bbox_inches='tight', dpi=300)
+            plt.close()
+        else:
+            plt.show()
 
     def plot_final_odor_data_by_sensor(
-            self, odor_name: str, subtract_baseline=False, ax: plt.Axes = None, normalize=False):
+            self, odor_name: str, subtract_baseline=False, ax: plt.Axes = None, normalize=False,
+            save_fig_root: str | None = None
+    ):
         add_labels = ax is None
         if ax is None:
             fig, ax = plt.subplots(1, 1)
@@ -529,7 +553,15 @@ class AryballeRecords:
             ax.set_xlabel("Sensor")
             ax.set_ylabel("Amplitude")
             ax.set_title(odor_name)
-            plt.show()
+
+            if save_fig_root:
+                fig = plt.gcf()
+                fig.set_size_inches(15, 9)
+                fig.savefig(
+                    f"{save_fig_root}/{odor_name}_norm={int(normalize)}.png", bbox_inches='tight', dpi=300)
+                plt.close()
+            else:
+                plt.show()
 
     def plot_all_final_odor_data_by_sensor(self, subtract_baseline=False, normalize=False, n_rows=3):
         odors = list(sorted(set(r.sample_name for r in self.records)))
@@ -716,7 +748,6 @@ class AryballeRecords:
                 ax.scatter(*proj[0, :], marker=marker, color=color)
 
         ax.legend(handles=[mpatches.Patch(color=c, label=t) for t, c in odor_color.items()])
-        print(pca.explained_variance_ratio_)
         ax.set_xlabel("PCA 1")
         ax.set_xlabel("PCA 2")
         fig.suptitle(f"PCA - explained variance = {sum(pca.explained_variance_ratio_):0.2f}")
