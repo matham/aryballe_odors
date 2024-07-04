@@ -1,4 +1,5 @@
 import csv
+from copy import deepcopy
 from sklearn.naive_bayes import GaussianNB
 from pathlib import Path
 import re
@@ -70,6 +71,8 @@ class TrialSegment:
     """A 1d of same length as rows in `data`. Each item is the unix time corresponding to the row.
     """
 
+    duration: float
+
     humidity: np.ndarray
     """A 1d of same length as rows in `data`. Each item is humidity sensor measurement corresponding to the row.
     """
@@ -97,19 +100,32 @@ class TrialSegment:
         self.data = data
 
     def segment_from_data(self, data, sensor_id=None, sensor_id_unique=None) -> "TrialSegment":
-        cls = self.__class__
-        if sensor_id is None:
-            sensor_id = self.sensor_id
-        if sensor_id_unique is None:
-            sensor_id_unique = self.sensor_id_unique
-
-        if data.shape[-1] != len(sensor_id):
+        if sensor_id is not None and data.shape[-1] != len(sensor_id):
             raise ValueError("Data size doesn't match sensor ids")
 
+        seg = deepcopy(self)
+
+        if sensor_id is not None:
+            seg.sensor_id = list(sensor_id)
+        if sensor_id_unique is not None:
+            seg.sensor_id_unique = list(sensor_id_unique)
+        seg.data = data.copy()
+
+        return seg
+
+    def __deepcopy__(self, memodict={}):
+        cls = self.__class__
         seg = cls(
-            sensor_id=sensor_id, sensor_id_unique=sensor_id_unique, relative_time=self.time_running,
-            unix_time=self.unix_time, humidity=self.humidity, temp=self.temp, data=data
+            sensor_id=list(self.sensor_id),
+            sensor_id_unique=list(self.sensor_id_unique),
+            relative_time=self.time_running.copy() if self.time_running is not None else None,
+            unix_time=self.unix_time.copy() if self.unix_time is not None else None,
+            humidity=self.humidity.copy() if self.humidity is not None else None,
+            temp=self.temp.copy() if self.temp is not None else None,
+            data=self.data.copy() if self.data is not None else None,
         )
+        if self.desorption_linear_offset is not None:
+            seg.desorption_linear_offset = self.desorption_linear_offset.copy()
         return seg
 
 
@@ -207,12 +223,24 @@ class AryballeRecord:
             f"tags=[{','.join(sorted(self.tags))}]>"
         )
 
-    def record_from_normalization(self, normalization: set) -> "AryballeRecord":
+    def __deepcopy__(self, memodict={}):
         record = self.__class__(
             self.record, run_id=self.run_id, run_name=self.run_name, device_id=self.device_id,
-            sample_name=self.sample_name, cycle=self.cycle, sensor_id=[], sensor_id_unique=[], baseline=None, odor=None,
-            iti=None, tags=self.tags, h2o_affinity=self.h2o_affinity, blank_sensor=self.blank_sensor,
+            sample_name=self.sample_name, cycle=self.cycle, sensor_id=list(self.sensor_id),
+            sensor_id_unique=list(self.sensor_id_unique), baseline=None, odor=None,
+            iti=None, tags=set(self.tags),
+            h2o_affinity=self.h2o_affinity.copy() if self.h2o_affinity is not None else None,
+            blank_sensor=self.blank_sensor,
         )
+
+        record.baseline = deepcopy(self.baseline)
+        record.odor = deepcopy(self.odor)
+        record.iti = deepcopy(self.iti)
+
+        return record
+
+    def record_from_normalization(self, normalization: set) -> "AryballeRecord":
+        record = deepcopy(self)
 
         seg: TrialSegment
         for name in ("baseline", "odor", "iti"):
@@ -229,15 +257,10 @@ class AryballeRecord:
 
         return record
 
-    def record_from_transform(self, transformer, labels: list[str], labels_unique: list[str] | None = None) -> "AryballeRecord":
-        if labels_unique is None:
-            labels_unique = labels
-        record = self.__class__(
-            self.record, run_id=self.run_id, run_name=self.run_name, device_id=self.device_id,
-            sample_name=self.sample_name, cycle=self.cycle, sensor_id=labels, sensor_id_unique=labels_unique,
-            baseline=None, odor=None, iti=None, tags=self.tags, h2o_affinity=self.h2o_affinity,
-            blank_sensor=self.blank_sensor,
-        )
+    def record_from_transform(self, transformer, sensor_id: list[str], sensor_id_unique: list[str]) -> "AryballeRecord":
+        record = deepcopy(self)
+        record.sensor_id = list(sensor_id)
+        record.sensor_id_unique = list(sensor_id_unique)
 
         seg: TrialSegment
         for name in ("baseline", "odor", "iti"):
@@ -246,7 +269,7 @@ class AryballeRecord:
                 continue
 
             new_data = transformer(seg.data)
-            new_seg = seg.segment_from_data(new_data, labels, labels_unique)
+            new_seg = seg.segment_from_data(new_data, sensor_id, sensor_id_unique)
 
             setattr(record, name, new_seg)
 
@@ -543,6 +566,11 @@ class AryballeRecord:
 
         return data, sensor_ids
 
+    def get_final_humidity_data(self) -> float:
+        if self.odor is None or self.odor.humidity is None:
+            return 0
+        return self.odor.humidity[-1]
+
     def estimate_baseline_slope(self) -> dict[str, np.ndarray]:
         """Estimates the slope of the time series baseline data.
 
@@ -608,7 +636,7 @@ class AryballeRecords:
     def process_records(self, records: list[AryballeRecord], normalization: set) -> None:
         self.records = [r.record_from_normalization(normalization) for r in records]
 
-    def add_aryballe_csv_records(self, *filenames: str) -> None:
+    def add_aryballe_csv_records(self, *filenames: str | Path) -> None:
         """Adds the records from the given CSV file to `records`.
 
         :param filename: The CSV filename as exported from Aryballe hub.
@@ -633,7 +661,7 @@ class AryballeRecords:
 
         return list(zip(indices, indices[1:] + [len(data)]))
 
-    def parse_records_aryballe_csv(self, filename: str) -> list[AryballeRecord]:
+    def parse_records_aryballe_csv(self, filename: str | Path) -> list[AryballeRecord]:
         """Parses and returns the records from the given CSV file.
 
         :param filename: The CSV filename as exported from Aryballe hub.
@@ -707,7 +735,7 @@ class AryballeRecords:
 
         return records
 
-    def add_prism_xlsx_records(self, *filenames: str) -> None:
+    def add_prism_xlsx_records(self, *filenames: str | Path) -> None:
         for filename in filenames:
             self.records.extend(self.parse_records_prism_xlsx(filename))
 
@@ -719,7 +747,7 @@ class AryballeRecords:
         p, label = m.groups()
         return f"{label} {p}"
 
-    def _parse_prism_experiment_structure(self, filename: str) -> list[tuple[str, float, float, float | None]]:
+    def _parse_prism_experiment_structure(self, filename: str | Path) -> list[tuple[str, float, float, float | None]]:
         plan = pd.read_excel(
             filename, sheet_name="Comments", skiprows=2, header=None,
             usecols=[0, 1, 2, 3, 4],
@@ -768,7 +796,7 @@ class AryballeRecords:
 
         return trials
 
-    def parse_records_prism_xlsx(self, filename: str) -> list[AryballeRecord]:
+    def parse_records_prism_xlsx(self, filename: str | Path) -> list[AryballeRecord]:
         kinetics = pd.read_excel(
             filename, sheet_name="Kinetics", header=(0, 1), dtype=np.float_
         )
@@ -863,9 +891,9 @@ class AryballeRecords:
 
         return fig, ax_flat, odors
 
-    def _save_or_show(self, normalization_names: set, save_fig_root: str | None = None, save_fig_prefix: str = ""):
+    def _save_or_show(self, normalization_names: set, save_fig_root: None | Path = None, save_fig_prefix: str = ""):
         if save_fig_root:
-            Path(save_fig_root).mkdir(parents=True, exist_ok=True)
+            save_fig_root.mkdir(parents=True, exist_ok=True)
 
             norm = "none"
             if normalization_names:
@@ -879,7 +907,7 @@ class AryballeRecords:
                 fig_size = fig.get_size_inches()[0] * fig.dpi
                 fig.subplots_adjust(right=1 - legend.get_window_extent().width / fig_size)
             fig.savefig(
-                f"{save_fig_root}/{save_fig_prefix}_norm={norm}.png", bbox_inches='tight',
+                save_fig_root / f"{save_fig_prefix}_norm={norm}.png", bbox_inches='tight',
                 dpi=300
             )
             plt.close()
@@ -894,7 +922,7 @@ class AryballeRecords:
 
     def plot_by_sensor_id(
             self, n_sensors, odor_name: str, normalization_names: set, section=None, n_rows=3,
-            save_fig_root: str | None = None, save_fig_prefix: str = "", show_humidity=False
+            save_fig_root: None | Path = None, save_fig_prefix: str = "", show_humidity=False
     ):
         fig, ax_map = self._get_fig_by_sensor(n_sensors, n_rows, sharey=False, sharex=True, with_humidity=show_humidity)
         ax_count = defaultdict(int)
@@ -923,13 +951,13 @@ class AryballeRecords:
         self._save_or_show(normalization_names, save_fig_root, save_fig_prefix + f"_{odor_name}")
 
     def _get_final_odor_data(
-            self, odor_name: str,
+            self, mapped_odor_name: str
     ) -> tuple[list[tuple[int, str]], list[tuple[int, np.ndarray]]]:
         sensors = []
         sensor_names = []
         sensor_id = self.sensor_id
         for record in self.records:
-            if record.sample_name != odor_name:
+            if record.sample_name != mapped_odor_name:
                 continue
 
             data = record.get_final_odor_sensor_data(normalization=set())
@@ -960,7 +988,7 @@ class AryballeRecords:
         return sample_names, sample_arrays
 
     def plot_final_odor_data_waterfall_all_odors(
-            self, normalization_names: set, average_trials: bool, save_fig_root: str | None = None,
+            self, normalization_names: set, average_trials: bool, save_fig_root: None | Path = None,
             save_fig_prefix: str = ""
     ):
         fig, ax = plt.subplots(1, 1)
@@ -1001,7 +1029,7 @@ class AryballeRecords:
 
     def plot_final_odor_data_waterfall_by_odor(
             self, odor_name: str, normalization_names: set, ax: plt.Axes = None,
-            save_fig_root: str | None = None, save_fig_prefix: str = ""
+            save_fig_root: None | Path = None, save_fig_prefix: str = ""
     ):
         add_labels = ax is None
         if ax is None:
@@ -1024,7 +1052,7 @@ class AryballeRecords:
 
     def plot_all_final_odor_data_waterfall_by_odor(
             self, normalization_names: set, n_rows=3,
-            save_fig_root: str | None = None, save_fig_prefix: str = ""
+            save_fig_root: None | Path = None, save_fig_prefix: str = ""
     ):
         fig, axes, names = self._get_axes_for_odors(n_rows, sharex=True, sharey=False)
         for ax, name in zip(axes, names):
@@ -1042,7 +1070,7 @@ class AryballeRecords:
 
     def plot_final_odor_data_by_odor(
             self, odor_name: str, normalization_names: set, ax: plt.Axes = None,
-            save_fig_root: str | None = None, save_fig_prefix: str = ""
+            save_fig_root: None | Path = None, save_fig_prefix: str = ""
     ):
         add_labels = ax is None
         if ax is None:
@@ -1062,7 +1090,7 @@ class AryballeRecords:
 
     def plot_all_final_odor_data_by_odor(
             self, normalization_names: set, n_rows=3,
-            save_fig_root: str | None = None, save_fig_prefix: str = ""
+            save_fig_root: None | Path = None, save_fig_prefix: str = ""
     ):
         fig, axes, names = self._get_axes_for_odors(n_rows, sharex=True, sharey=False)
         for ax, name in zip(axes, names):
@@ -1076,7 +1104,7 @@ class AryballeRecords:
 
     def plot_final_odor_data_by_sensor(
             self, sensor_id: str | None, normalization_names: set, average_trials: bool, ax: plt.Axes = None,
-            save_fig_root: str | None = None, save_fig_prefix: str = ""
+            save_fig_root: None | Path = None, save_fig_prefix: str = ""
     ):
         add_labels = ax is None
         fig = None
@@ -1116,7 +1144,7 @@ class AryballeRecords:
 
     def plot_all_final_odor_data_by_sensor(
             self, normalization_names: set, average_trials: bool, n_rows=3,
-            save_fig_root: str | None = None, save_fig_prefix: str = ""
+            save_fig_root: None | Path = None, save_fig_prefix: str = ""
     ):
         fig, ax_map = self._get_fig_by_sensor(
             len(set(self.sensor_id)) + 2, n_rows, sharey=False, sharex=True, remaining_id="None"
@@ -1140,7 +1168,7 @@ class AryballeRecords:
 
     def plot_final_odor_distance_by_sensor(
             self, sensor_id: str | None, plot_type: str, normalization_names: set, ax: plt.Axes = None, fig: plt.Figure = None,
-            save_fig_root: str | None = None, save_fig_prefix: str = ""
+            save_fig_root: None | Path = None, save_fig_prefix: str = ""
     ):
         add_labels = ax is None
         if ax is None:
@@ -1181,7 +1209,7 @@ class AryballeRecords:
         return sample_names
 
     def plot_all_final_odor_distance_by_sensor(
-            self, normalization_names: set, plot_type: str, n_rows=3, save_fig_root: str | None = None,
+            self, normalization_names: set, plot_type: str, n_rows=3, save_fig_root: None | Path = None,
             save_fig_prefix: str = ""
     ):
         fig, ax_map = self._get_fig_by_sensor(
@@ -1209,58 +1237,63 @@ class AryballeRecords:
         self._save_or_show(normalization_names, save_fig_root, save_fig_prefix)
 
     def plot_final_odor_data_class_probability(
-            self, normalization_names: set, split: float, excluded_records: set = None,
-            save_fig_root: str | None = None, save_fig_prefix: str = ""
+            self, normalization_names: set, split: float, cls_map: dict, excluded_records: set = None,
+            save_fig_root: None | Path = None, save_fig_prefix: str = ""
     ):
         excluded_records = excluded_records or set()
         fig, (ax1, ax2) = plt.subplots(1, 2)
         odors = list(sorted(set(r.sample_name for r in self.records if r.sample_name not in excluded_records)))
-        odor_codes = {name: i for i, name in enumerate(odors)}
+        odor_groups = list(sorted(set(cls_map[o] for o in odors)))
+        odors = list(sorted(odors, key=lambda o: (odor_groups.index(cls_map[o]), o)))
 
         all_data = []
-        data_class = []
+        all_data_class = []
+        all_trial_count = 0
+        all_x_ticks = []
+
         train_data = []
         train_class = []
         test_data = []
-        trial_count = 0
-        trial_ticks = []
         test_count = 0
-        test_ticks = []
-        for class_, odor in enumerate(odors):
+        test_x_ticks = []
+        for odor in odors:
+            class_ = odor_groups.index(cls_map[odor])
             sensor_names, trials = self._get_final_odor_data(odor)
             data = np.asarray([t[1] for t in trials])
 
             all_data.append(data)
-            data_class.extend([class_,] * len(data))
-
-            trial_ticks.append((trial_count, odor_codes[odor]))
-            trial_count += len(data)
+            all_data_class.extend([class_,] * len(data))
+            all_x_ticks.append((all_trial_count, odors.index(odor)))
+            all_trial_count += len(data)
 
             n = int(round(len(data) * split))
             rem = len(data) - n
             train_data.append(data[:n, :])
-            test_data.append(data[n:, :])
             train_class.extend([class_,] * n)
+            test_data.append(data[n:, :])
 
             if rem:
-                test_ticks.append((test_count, odor_codes[odor]))
+                test_x_ticks.append((test_count, odors.index(odor)))
                 test_count += rem
 
         all_data = np.vstack(all_data)
-        data_class = np.asarray(data_class)
+        all_data_class = np.asarray(all_data_class)
 
         clf = GaussianNB()
-        clf.fit(all_data, data_class)
+        clf.fit(all_data, all_data_class)
         probs = clf.predict_proba(all_data)
 
-        image = ax1.imshow(probs.T, origin="lower", interpolation="none", aspect="auto")
+        image = ax1.imshow(
+            probs.T, origin="lower", interpolation="none", aspect="auto",
+            extent=[0, probs.shape[0], 0, len(odor_groups)]
+        )
 
         divider = make_axes_locatable(ax1)
         cax = divider.append_axes('right', size='5%', pad=0.05)
         fig.colorbar(image, cax=cax, orientation='vertical')
 
-        ax1.set_xticks([v[0] for v in trial_ticks], [v[1] for v in trial_ticks])
-        ax1.set_yticks(list(range(len(odors))), list(range(len(odors))))
+        ax1.set_xticks([v[0] for v in all_x_ticks], [v[1] for v in all_x_ticks])
+        ax1.set_yticks(list(range(len(odor_groups))), list(range(len(odor_groups))))
         ax1.set_ylabel("Odor classes")
         ax1.set_xlabel("Odor trials")
         ax1.set_title("Odor class trial train probability")
@@ -1269,26 +1302,29 @@ class AryballeRecords:
         clf.fit(np.vstack(train_data), np.asarray(train_class))
         probs = clf.predict_proba(np.vstack(test_data))
 
-        image = ax2.imshow(probs.T, origin="lower", interpolation="none", aspect="auto")
+        image = ax2.imshow(
+            probs.T, origin="lower", interpolation="none", aspect="auto",
+            extent=[0, probs.shape[0], 0, len(odor_groups)]
+        )
 
         divider = make_axes_locatable(ax2)
         cax = divider.append_axes('right', size='5%', pad=0.05)
         fig.colorbar(image, cax=cax, orientation='vertical')
 
-        ax2.set_xticks([v[0] for v in test_ticks], [v[1] for v in test_ticks])
-        ax2.set_yticks(list(range(len(odors))), list(range(len(odors))))
+        ax2.set_xticks([v[0] for v in test_x_ticks], [v[1] for v in test_x_ticks])
+        ax2.set_yticks(list(range(len(odor_groups))), list(range(len(odor_groups))))
         ax2.set_ylabel("Odor classes")
         ax2.set_xlabel("Odor trials")
         ax2.set_title("Odor class trial test probability")
 
         fig.legend(
-            handles=[mpatches.Patch(label=f"{i} - {n}", fill=False, linestyle="none") for i, n in enumerate(odors)]
+            handles=[mpatches.Patch(label=f"{i} - {n} - cls {odor_groups.index(cls_map[n])}", fill=False, linestyle="none") for i, n in enumerate(odors)]
         )
 
         self._save_or_show(normalization_names, save_fig_root, save_fig_prefix)
 
     def plot_all_final_odor_data_across_time(
-            self, n_sensors, normalization_names: set, n_rows=3, save_fig_root: str | None = None, save_fig_prefix: str = ""):
+            self, n_sensors, normalization_names: set, n_rows=3, save_fig_root: None | Path = None, save_fig_prefix: str = ""):
         records = sorted(self.records, key=lambda r: r.baseline.unix_time[0])
         fig, ax_map = self._get_fig_by_sensor(n_sensors, n_rows, sharey=False, sharex=True)
         cmap = plt.get_cmap('tab20')
@@ -1443,7 +1479,7 @@ class AryballeRecords:
 
     def process_records_pca(self, records: list[AryballeRecord], pca: PCA) -> None:
         labels = list(map(str, range(pca.n_components_)))
-        self.records = [r.record_from_transform(pca.transform, labels) for r in records]
+        self.records = [r.record_from_transform(pca.transform, labels, labels) for r in records]
 
     def process_sensors_greatest_var(self, n_dim=2, excluded_records: set[str] = None):
         data = self._gather_records_data(excluded_records)
@@ -1473,7 +1509,7 @@ class AryballeRecords:
         self.records = [r.record_from_transform(process, self.sensor_id, self.sensor_id_unique) for r in self.records]
 
     def plot_sensor_pca(
-            self, pca, normalization_names: set, n_dim=2, added_records=None, save_fig_root: str | None = None,
+            self, pca, normalization_names: set, n_dim=2, added_records=None, save_fig_root: None | Path = None,
             save_fig_prefix: str = ""):
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d" if n_dim == 3 else None)
@@ -1575,6 +1611,58 @@ class AryballeRecords:
         header = ",".join([n.replace(",", "_") for n in names])
         np.savetxt(filename, table, delimiter=",", header=header)
 
+    def export_final_odor_csv(self, root: Path, normalization_names: set[str], prefix: str):
+        if not normalization_names:
+            normalization_names = {"none"}
+        norms = ",".join(sorted([n.replace(",", "_") for n in normalization_names]))
+
+        header_base = ["run_id", "run_name", "device_id", "sample_name", "cycle", "humidity"]
+
+        root.mkdir(parents=True, exist_ok=True)
+        with open(root / f"{prefix}_normalizations={norms}.csv", "w") as fh:
+            fh.write(",".join(header_base + [n.replace(",", "_") for n in self.sensor_id]))
+            fh.write("\n")
+
+            for record in self.records:
+                fh.write(
+                    f"{record.run_id},{record.run_name},{record.device_id},"
+                    f"{record.sample_name.replace(',', '_')},{record.cycle},"
+                    f"{record.get_final_humidity_data()},"
+                )
+                fh.write(",".join(map(str, record.get_flat_final_odor_sensor_data(set())[0].squeeze())))
+                fh.write("\n")
+
+    def rename_records(self, base_names: tuple[str, ...]):
+        new_records = []
+        for record in self.records:
+            for n in base_names:
+                if record.sample_name.lower().startswith(n.lower()):
+                    name = n.lower()
+                    break
+            else:
+                name = record.sample_name.lower()
+
+            new_record = deepcopy(record)
+            new_record.sample_name = name
+            new_records.append(new_record)
+
+        self.records = new_records
+
+    def get_odor_names_map(self, base_names: tuple[str, ...] = ()) -> dict[str, str]:
+        names = set(r.sample_name for r in self.records)
+        name_map = {}
+
+        for name in names:
+            for n in base_names:
+                if name.lower().startswith(n.lower()):
+                    new_name = n.lower()
+                    break
+            else:
+                new_name = name.lower()
+            name_map[name] = new_name
+
+        return name_map
+
 
 def norm_combinations(*norms: str, dedup=False) -> list[set[str]]:
     all_combinations = []
@@ -1592,79 +1680,102 @@ def norm_combinations(*norms: str, dedup=False) -> list[set[str]]:
 
 
 if __name__ == "__main__":
+    dataset = "aryballe"
+    dataset = "prism"
+
+    excluded_analysis = {"Blank", "Room air", "Water", "water"}
     records = AryballeRecords()
 
-    n_rows = 3
-    prefix = "aryballe"
-    fig_root = r"C:\Users\Matthew Einhorn\Downloads\figs"
+    if dataset == "aryballe":
+        n_rows = 3
+        norms_used = "blank", "norm_to_area", "humidity"
+        base_names = 'CH4', 'NH3', 'Room air', 'TBP', 'TEP'
+        root = Path(r"D:\code_data\aryballe")
 
-    records.add_aryballe_csv_records(r"C:\Users\Matthew Einhorn\Downloads\sensors\CTTYN_40s_10min.sensograms.csv")
-    # records.add_prism_xlsx_records(
-    #     r"C:\Users\Matthew Einhorn\Downloads\Prism 5\data\20230411.xlsx",
-    #     r"C:\Users\Matthew Einhorn\Downloads\Prism 5\data\20230503.xlsx",
-    #     r"C:\Users\Matthew Einhorn\Downloads\Prism 5\data\20230426.xlsx",
-    #     r"C:\Users\Matthew Einhorn\Downloads\Prism 5\data\20230403.xlsx",
-    #     r"C:\Users\Matthew Einhorn\Downloads\Prism 5\data\20230419.xlsx",
-    #     r"C:\Users\Matthew Einhorn\Downloads\Prism 5\data\20230406.xlsx",
-    # )
-    raw_records = records.records
+        records.add_aryballe_csv_records(root / "sensors" / "CTTYN_40s_10min.sensograms.csv")
+
+        # records.compute_records_desorption_offset_line()
+        records.remove_first_trial_records()
+        records.compute_h2o_affinity(remove_h2o_records=True, h2o_name="Water")
+
+    elif dataset == "prism":
+        n_rows = 4
+        norms_used = "blank", "norm_to_area", "baseline"
+        base_names = "Butanol", "Hexanol", "Toluene", "m-Xylene", "o-Xylene", "p-Xylene"
+        root = Path(r"D:\code_data\Prism 5")
+
+        records.add_prism_xlsx_records(
+            root / "data" / "20230411.xlsx",
+            root / "data" / "20230503.xlsx",
+            root / "data" / "20230426.xlsx",
+            root / "data" / "20230403.xlsx",
+            root / "data" / "20230419.xlsx",
+            root / "data" / "20230406.xlsx",
+        )
+    else:
+        assert False
+
+    prefix = dataset
+    fig_root = root / "figs"
+    csv_root = root / "csv"
     # for record in records.records:
     #     print(record)
+    # print(sorted({r.sample_name for r in records.records}))
+    raw_records = records.records
 
-    # records.compute_records_desorption_offset_line()
-    records.remove_first_trial_records()
-    records.compute_h2o_affinity(remove_h2o_records=True, h2o_name="Water")
+    for dedup in ("dedup", "with_dup"):
+        all_combinations = norm_combinations(*norms_used, dedup=dedup == "dedup")
 
-    for dedup in (True, False):
-        all_combinations = norm_combinations("blank", "norm_to_area", "humidity", dedup=dedup)
-        if dedup:
-            root_ = fig_root + r"\dedup"
-        else:
-            root_ = fig_root + r"\with_dup"
-
-        for proc in ("normal", "pca", "var_ordered"):
-            root = root_ + fr"\{proc}"
+        for proc in ("untransformed", "pca", "var_ordered"):
+            fig_root_ = fig_root / dedup / proc
 
             for norms in all_combinations:
-                print(dedup, proc, norms)
+                print(proc, norms)
                 records.process_records(raw_records, norms)
 
                 if proc == "var_ordered":
-                    records.process_sensors_greatest_var(n_dim=None, excluded_records={"Blank"})
+                    records.process_sensors_greatest_var(n_dim=None, excluded_records=excluded_analysis)
                 elif proc == "pca":
-                    pca = records.compute_sensor_pca(n_dim=8, excluded_records={"Blank"})
+                    pca = records.compute_sensor_pca(n_dim=8, excluded_records=excluded_analysis)
                     records.process_records_pca(records.records, pca)
 
+                records.export_final_odor_csv(csv_root / dedup / proc, norms, prefix)
+
                 records.plot_all_final_odor_data_by_odor(
-                    norms, save_fig_root=root + r"\by_odor", save_fig_prefix=prefix, n_rows=n_rows
+                    norms, save_fig_root=fig_root_ / "by_odor", save_fig_prefix=prefix, n_rows=n_rows
                 )
                 records.plot_all_final_odor_data_waterfall_by_odor(
-                    norms, save_fig_root=root + r"\by_odor_waterfall", save_fig_prefix=prefix, n_rows=n_rows
+                    norms, save_fig_root=fig_root_ / "by_odor_waterfall", save_fig_prefix=prefix, n_rows=n_rows
                 )
                 records.plot_final_odor_data_waterfall_all_odors(
-                    norms, False, save_fig_root=root + r"\all_odors_and_sensors", save_fig_prefix=prefix
+                    norms, False, save_fig_root=fig_root_ / "all_odors_and_sensors", save_fig_prefix=prefix
                 )
                 records.plot_final_odor_data_waterfall_all_odors(
-                    norms, True, save_fig_root=root + r"\all_odors_and_sensors_avg_trial",
+                    norms, True, save_fig_root=fig_root_ / "all_odors_and_sensors_avg_trial",
                     save_fig_prefix=prefix
                 )
                 records.plot_all_final_odor_distance_by_sensor(
-                    norms, "dist_of_avg", save_fig_root=root + r"\by_odor_dist_of_avg", save_fig_prefix=prefix,
+                    norms, "dist_of_avg", save_fig_root=fig_root_ / "by_odor_dist_of_avg", save_fig_prefix=prefix,
                     n_rows=n_rows
                 )
                 records.plot_all_final_odor_distance_by_sensor(
-                    norms, "avg_of_dist", save_fig_root=root + r"\by_odor_avg_of_dist", save_fig_prefix=prefix,
+                    norms, "avg_of_dist", save_fig_root=fig_root_ / "by_odor_avg_of_dist", save_fig_prefix=prefix,
                     n_rows=n_rows
                 )
                 records.plot_all_final_odor_data_by_sensor(
-                    norms, average_trials=False, save_fig_root=root + r"\by_sensor", save_fig_prefix=prefix,
+                    norms, average_trials=False, save_fig_root=fig_root_ / "by_sensor", save_fig_prefix=prefix,
                     n_rows=n_rows
                 )
                 records.plot_all_final_odor_data_by_sensor(
-                    norms, average_trials=True, save_fig_root=root + r"\by_sensor_avg_trial", save_fig_prefix=prefix,
+                    norms, average_trials=True, save_fig_root=fig_root_ / "by_sensor_avg_trial", save_fig_prefix=prefix,
                     n_rows=n_rows
+                )
+
+                records.plot_final_odor_data_class_probability(
+                    norms, 0.8, records.get_odor_names_map(), excluded_records=excluded_analysis,
+                    save_fig_root=fig_root_ / "naive_bayes_classification", save_fig_prefix=prefix
                 )
                 records.plot_final_odor_data_class_probability(
-                    norms, 0.8, excluded_records={"Blank"},
-                    save_fig_root=root + r"\naive_bayes_classification", save_fig_prefix=prefix
+                    norms, 0.8, records.get_odor_names_map(base_names), excluded_records=excluded_analysis,
+                    save_fig_root=fig_root_ / "naive_bayes_classification_merge_backgrounds", save_fig_prefix=prefix
                 )
